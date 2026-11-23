@@ -547,6 +547,7 @@ pub fn init() -> Result<String, String> {
         }
         open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
+        super::device_x::probe_rgb9e5_targets(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -2166,6 +2167,18 @@ fn default_dsv(d: &D3D12_RESOURCE_DESC) -> Option<D3D12_DEPTH_STENCIL_VIEW_DESC>
     Some(v)
 }
 
+/// A shader view's component mapping with every read of the fourth component (alpha) made the
+/// constant 1 (D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1); the other choices as they were.
+fn alpha_read_as_one(mapping: u32) -> u32 {
+    let mut m = mapping;
+    for i in 0..4 {
+        if (m >> (3 * i)) & 7 == 3 {
+            m = (m & !(7 << (3 * i))) | (5 << (3 * i));
+        }
+    }
+    m
+}
+
 /// A shader view `v` (None: the resource's default one) of `rd` with the PC's format names
 /// (`device_x::pc_shader_view_format`) – None: as it is.
 fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
@@ -2209,6 +2222,11 @@ fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>)
     let stencil = super::device_x::stencil_view(rf, f);
     if v.is_some() && f == out.Format.0 as u32 && !stencil {
         return None;
+    }
+    // an R9G9B9E5 view of a target made half floats: that format has no alpha and reads 1 there,
+    // where the half floats hold whatever the title's pixel shader wrote
+    if (rf, out.Format.0 as u32, f) == (10, 67, 10) {
+        out.Shader4ComponentMapping = alpha_read_as_one(out.Shader4ComponentMapping);
     }
     out.Format = DXGI_FORMAT(f as i32);
     // the PC reads stencil from plane 1; the console's view of it is plane 0 in a stencil format
@@ -7860,6 +7878,31 @@ mod srv_tests {
             assert_eq!(resource_dim_to_view(&desc), dim, "{samples} samples, {slices} slices");
             assert_eq!(v.ViewDimension.0, dim);
         }
+    }
+
+    /// An R9G9B9E5 view of a target made half floats reads alpha 1, as that format does; the
+    /// title's other component choices stay.
+    #[test]
+    fn an_rgb9e5_view_of_half_floats_reads_alpha_one() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        assert_eq!(alpha_read_as_one(0x1688), 0x1A88); // R, G, B, 1
+        // B, A, R, constant 0 → B, 1, R, constant 0
+        assert_eq!(alpha_read_as_one(0x1000 | 2 | 3 << 3 | 4 << 9), 0x1000 | 2 | 5 << 3 | 4 << 9);
+        let rd = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Format: DXGI_FORMAT(10), DepthOrArraySize: 1, ..Default::default() };
+        let v = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT(67),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 0x1688,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+        };
+        let out = pc_srv(&rd, Some(&v)).expect("the view is made a half-float one");
+        assert_eq!((out.Format.0, out.Shader4ComponentMapping), (10, 0x1A88));
+        // a half-float view of it, or an R9G9B9E5 texture that stayed one: as the title made them
+        let mut half = v;
+        half.Format = DXGI_FORMAT(10);
+        assert!(pc_srv(&rd, Some(&half)).is_none());
+        let rd67 = D3D12_RESOURCE_DESC { Format: DXGI_FORMAT(67), ..rd };
+        assert!(pc_srv(&rd67, Some(&v)).is_none());
     }
 }
 

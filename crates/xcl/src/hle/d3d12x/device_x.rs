@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
@@ -149,6 +149,27 @@ pub(super) unsafe extern "system" fn create_graphics_pso_x(this: *mut c_void, de
 /// derived pipelines and tagged with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when supported.
 pub(super) unsafe extern "system" fn create_graphics_pso_pc(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     create_graphics_pso_tracked(this, desc, riid, ppv)
+}
+
+/// Whether R9G9B9E5_SHAREDEXP render targets and UAVs are made half floats (`pc_resource_desc`,
+/// `pc_target_format`): some PC drivers take the format neither as a target nor through unordered
+/// access (NVIDIA: E_INVALIDARG), others take both (an AMD RDNA4 card). Half floats until the
+/// device is asked (`probe_rgb9e5_targets`).
+static RGB9E5_AS_HALF: AtomicBool = AtomicBool::new(true);
+
+/// `CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT)` for R9G9B9E5_SHAREDEXP: its targets keep
+/// the format when the device renders into it and stores to it through typed UAVs.
+pub(super) fn probe_rgb9e5_targets(dev: &ID3D12Device) {
+    let mut s = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(67), ..Default::default() };
+    let native = unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut s as *mut _ as *mut c_void, std::mem::size_of_val(&s) as u32) }.is_ok()
+        && s.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0
+        && s.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+        && s.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
+    RGB9E5_AS_HALF.store(!native, Ordering::Relaxed);
+    crate::xlog_info!(
+        "D3D12.X: R9G9B9E5 render targets / UAVs: {}",
+        if native { "kept (the device renders into the format and stores to it)" } else { "half floats (the device does not render into the format or store to it)" }
+    );
 }
 
 /// Cached result of `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16).DynamicDepthBiasSupported`:
@@ -755,6 +776,11 @@ pub(super) unsafe fn pc_resource_desc_for_device(device: *mut c_void, x: &[u8; 0
 /// the console resource desc (0x38 bytes, D3D12_RESOURCE_DESC) as a PC one: its tile layouts
 /// and console flag bits mean nothing to a PC driver
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
+    resource_desc(x, RGB9E5_AS_HALF.load(Ordering::Relaxed))
+}
+
+/// `pc_resource_desc`, R9G9B9E5 targets made half floats or not
+fn resource_desc(x: &[u8; 0x38], rgb9e5_as_half: bool) -> [u8; 0x38] {
     let mut d = *x;
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
     let mut flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
@@ -784,12 +810,12 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if format == 88 && flags & 4 != 0 {
         d[0x20..0x24].copy_from_slice(&87u32.to_le_bytes());
     }
-    // R9G9B9E5_SHAREDEXP targets / UAVs: PC D3D12 forbids ALLOW_RENDER_TARGET and
-    // ALLOW_UNORDERED_ACCESS on format 67 (Series S 1920x1080 target, flags 0x300005:
-    // E_INVALIDARG) – R11G11B10_FLOAT is the same 32 bpp unsigned HDR float format with full
-    // PC RTV/UAV/SRV support. Sampled-only R9G9B9E5 textures stay format 67.
-    if format == 67 && flags & 5 != 0 {
-        d[0x20..0x24].copy_from_slice(&26u32.to_le_bytes());
+    // R9G9B9E5_SHAREDEXP targets: some PC drivers render into the format neither as a target nor
+    // through unordered access (a retail game's 1920x1080 one on the Series S profile, flags
+    // 0x300005: E_INVALIDARG on NVIDIA, then its assertion) – half floats hold every
+    // shared-exponent value exactly (`RGB9E5_AS_HALF`)
+    if format == 67 && flags & 5 != 0 && rgb9e5_as_half {
+        d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
     }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
@@ -859,11 +885,17 @@ fn depth_typeless(f: u32) -> Option<u32> {
 }
 
 /// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, and a
-/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8, an R9G9B9E5 target is R11G11B10_FLOAT (`pc_resource_desc`).
+/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8; an unsupported R9G9B9E5 target is
+/// R16G16B16A16_FLOAT (`pc_resource_desc`).
 pub fn pc_target_format(f: u32) -> u32 {
+    target_format(f, RGB9E5_AS_HALF.load(Ordering::Relaxed))
+}
+
+/// `pc_target_format`, R9G9B9E5 targets made half floats or not
+fn target_format(f: u32, rgb9e5_as_half: bool) -> u32 {
     match f {
         86 | 115 => 28,
-        67 => 26,
+        67 if rgb9e5_as_half => 10,
         f => pc_view_format(f),
     }
 }
@@ -887,8 +919,8 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         // a target made R8G8B8A8 / B8G8R8A8 (`pc_resource_desc`)
         (28, 85 | 86 | 115) => 28,
         (87, 88) => 87,
-        // a target made R11G11B10_FLOAT (`pc_resource_desc`)
-        (26, 67) => 26,
+        // an R9G9B9E5 target made half floats
+        (10, 67) => 10,
         (_, v) => v,
     }
 }
@@ -1320,7 +1352,7 @@ mod tests {
         let mut x = [0u8; 0x38];
         x[0] = 3; // texture 2D
         let desc = |x: &[u8; 0x38]| {
-            let d = pc_resource_desc(x);
+            let d = resource_desc(x, true);
             (u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()))
         };
         x[0x20] = 118; // D16_UNORM_S8_UINT, depth + UAV + console bits
@@ -1334,11 +1366,16 @@ mod tests {
         x[0x20] = 86; // B5G5R5A1 target that is also a UAV
         x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
         assert_eq!(desc(&x), (28, 0x5));
-        x[0x20] = 67; // R9G9B9E5_SHAREDEXP target + UAV
+        x[0x20] = 67; // R9G9B9E5 target that is also a UAV (and console bits): half floats
         x[0x30..0x34].copy_from_slice(&0x30_0005u32.to_le_bytes());
-        assert_eq!(desc(&x), (26, 0x5));
-        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // sampled-only R9G9B9E5 stays format 67
+        assert_eq!(desc(&x), (10, 0x5));
+        // on a device that renders into the format and stores to it (an AMD RDNA4 card): kept
+        let d = resource_desc(&x, false);
+        assert_eq!(u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), 67);
+        assert_eq!((target_format(67, true), target_format(67, false)), (10, 67));
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // a sampled one stays R9G9B9E5
         assert_eq!(desc(&x), (67, 0));
+        assert_eq!((pc_shader_view_format(10, 67), pc_shader_view_format(67, 67)), (10, 67));
         // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
         assert_eq!(pc_shader_view_format(44, 45), 46);
         assert_eq!(pc_shader_view_format(44, 56), 46);
