@@ -76,6 +76,8 @@ fn main() {
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
+        // a DXC worker process of a running XCL (`XCL_DXC_PROCESS`)
+        Some(xcl::gpu::recomp::dxc_process::WORKER_ARG) => xcl::gpu::recomp::dxc_process::serve(),
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
             0

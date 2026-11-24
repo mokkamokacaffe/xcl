@@ -205,7 +205,11 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   `report.json` has it under `dxc`. A compute program with many memory-window accesses is compiled
   as two libraries, the program and its accessors, and linked, which is much faster for DXC
   (`XCL_LINK_MEM=0` turns it off); the linker needs DXC 1.8 or newer. With an older one the first
-  attempt fails, `xcl.log` says so, and every program is compiled whole after that.
+  attempt fails, `xcl.log` says so, and every program is compiled whole after that. With
+  `XCL_DXC_PROCESS=1` DXC runs in worker processes
+  (`xcl.exe --dxc-worker`), each capped at 8 GB (`XCL_DXC_PROCESS=<MB>` for another cap; the cap is
+  per worker, one per DXC thread): a compile past the cap fails on its own instead of taking the
+  machine's memory or ending the title.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange

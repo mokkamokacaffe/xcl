@@ -53,6 +53,7 @@
 
 pub mod cfg;
 pub mod dxc;
+pub mod dxc_process;
 pub mod dxil;
 pub mod lane_masks;
 pub mod lower;

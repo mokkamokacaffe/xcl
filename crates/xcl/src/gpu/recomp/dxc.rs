@@ -381,7 +381,7 @@ fn compiler() -> Result<IDxcCompiler3, String> {
 /// Stack of the thread DXC runs on: its LLVM passes recurse along long dependency chains of
 /// big translated programs (2 MB overflowed on a 7 000-instruction retail PS); the caller may
 /// be a game thread with a small stack. Reserved, committed only as used.
-const DXC_STACK: usize = 64 << 20;
+pub(super) const DXC_STACK: usize = 64 << 20;
 
 struct Job {
     src: String,
@@ -479,7 +479,11 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                 };
                 let _slot = wait_for_memory(&job.wanted);
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+                // `XCL_DXC_PROCESS`: in this thread's worker process, under its memory cap
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match super::dxc_process::cap() {
+                    Some(cap) => super::dxc_process::compile(cap, &job.src, &job.entry, &job.profile, &extra),
+                    None => compile_here(&job.src, &job.entry, &job.profile, &extra),
+                }))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
                 let _ = job.reply.send(r);
             });
@@ -500,7 +504,7 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 /// takes the direct DXIL translator instead (`pso::compile_console_shader`).
 pub const UNOPTIMISED_ABOVE: usize = 8 * 1024 * 1024;
 
-fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+pub(super) fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     // compute (also what MS and GS programs run as): DXC's time for its memory accesses is
     // linear this way (`emit::linked_form`). Anything wrong with it: as one program, as before.
     if profile.starts_with("cs_") && linking() {
