@@ -623,6 +623,28 @@ struct Class {
     copied: Option<Box<[usize]>>,
 }
 
+fn matching_class(
+    classes: &[Class],
+    orig: usize,
+    kind: Kind,
+    iface: &'static Iface,
+    public: usize,
+    scanned: usize,
+    copied: Option<&[usize]>,
+) -> Option<usize> {
+    classes
+        .iter()
+        .find(|c| {
+            c.orig == orig
+                && c.kind == kind
+                && std::ptr::eq(c.iface, iface)
+                && c.public == public
+                && c.scanned == scanned
+                && c.copied.as_deref() == copied
+        })
+        .map(|c| c.ext)
+}
+
 static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
 static EXTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
@@ -729,11 +751,11 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
 }
 
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
-    let ot = orig as *const usize;
-    let same_methods = |c: &Class| c.copied.as_ref().is_none_or(|m| m.iter().enumerate().all(|(i, &f)| *ot.add(i) == f));
-    if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig && c.kind == kind && same_methods(c)) {
+    // Image-backed tables remain loaded for the process lifetime: preserve their cheap lookup.
+    if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig && c.kind == kind && c.copied.is_none()) {
         return c.ext;
     }
+    let ot = orig as *const usize;
     // most derived PC interface this object implements
     let chain = layout::chain(kind.base());
     let qi: QiFn = std::mem::transmute(*ot);
@@ -767,6 +789,17 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     for i in 0..scanned {
         v.push(*ot.add(i));
     }
+    // Derive the live table's own bounds before comparing it with an older generation at this
+    // heap address. A replacement table may have a different interface or internal tail length.
+    let methods = (module_of(orig) == 0).then_some(&v[1..]);
+    let matched = {
+        let classes = CLASSES.lock().unwrap();
+        matching_class(&classes, orig, kind, iface, public, scanned, methods)
+    };
+    if let Some(ext) = matched {
+        return ext;
+    }
+    let copied = methods.map(|m| m.to_vec().into_boxed_slice());
     let hook = if kind == Kind::CommandQueue { super::present::on_queue_console_method as usize } else { 0 };
     for i in public..scanned {
         let info = stubs::new_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
@@ -845,7 +878,6 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         scanned - public,
         crate::modules::describe_address(orig)
     );
-    let copied = (module_of(orig) == 0).then(|| (0..scanned).map(|i| *ot.add(i)).collect());
     CLASSES.lock().unwrap().push(Class { orig, kind, ext, iface, public, scanned, copied });
     ext
 }
@@ -8354,7 +8386,7 @@ mod mesh_stream_tests {
             iface,
             public: iface.methods.len(),
             scanned: iface.methods.len(),
-            copied: None,
+            copied: Some(pc.clone().into_boxed_slice()),
         });
         ABI_RS_SAMPLERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key.clone(), 0x1234_5678);
         let _cleanup = Cleanup { ext: ext_vtbl, key };
@@ -8918,6 +8950,45 @@ mod class_tests {
     use windows::Win32::Graphics::Dxgi::Common::*;
 
     #[test]
+    fn heap_classes_match_only_the_same_shape_and_methods() {
+        let iface = layout::find("ID3D12GraphicsCommandList").unwrap();
+        let public = iface.methods.len();
+        let scanned = public + 2;
+        let mut a = vec![1usize; scanned];
+        let mut b = a.clone();
+        b[public] = 2; // an internal method, after the public interface
+        let classes = vec![
+            Class {
+                orig: 0x1000,
+                kind: Kind::CommandList,
+                ext: 0xA,
+                iface,
+                public,
+                scanned,
+                copied: Some(a.clone().into_boxed_slice()),
+            },
+            Class {
+                orig: 0x1000,
+                kind: Kind::CommandList,
+                ext: 0xB,
+                iface,
+                public,
+                scanned,
+                copied: Some(b.clone().into_boxed_slice()),
+            },
+        ];
+
+        let a_ext = matching_class(&classes, 0x1000, Kind::CommandList, iface, public, scanned, Some(&a));
+        let b_ext = matching_class(&classes, 0x1000, Kind::CommandList, iface, public, scanned, Some(&b));
+        let a_again_ext = matching_class(&classes, 0x1000, Kind::CommandList, iface, public, scanned, Some(&a));
+        assert_eq!((a_ext, b_ext, a_again_ext), (Some(0xA), Some(0xB), Some(0xA)));
+        assert_eq!(matching_class(&classes, 0x1000, Kind::CommandList, iface, public, scanned - 1, Some(&a[..scanned - 1])), None);
+        a.push(1);
+        assert_eq!(matching_class(&classes, 0x1000, Kind::CommandList, iface, public, scanned + 1, Some(&a)), None);
+        assert_eq!(matching_class(&classes, 0x1000, Kind::CommandList, iface, public - 1, scanned, Some(&a[..scanned])), None);
+    }
+
+    #[test]
     fn a_direct_list_at_a_released_compute_lists_vtable_records_with_its_own_methods() {
         let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
             return crate::gpu::recomp::runner::skip_test("no GPU");
@@ -8948,21 +9019,20 @@ mod class_tests {
                 let v = vt(l.as_raw());
                 if is_ext(v as usize) { *v.sub(1) } else { v as usize }
             };
-            // the only class of `c` is one made from the methods there now
-            let made_from_now = |c: usize| {
-                let classes = CLASSES.lock().unwrap();
-                let mut of_c = classes.iter().filter(|k| k.orig == c && k.kind == Kind::CommandList);
-                match (of_c.next(), of_c.next()) {
-                    (Some(k), None) => k.copied.as_ref().is_some_and(|m| m.iter().enumerate().all(|(i, &f)| *(c as *const usize).add(i) == f)),
-                    _ => false,
-                }
-            };
-            let mut compute_made = HashSet::new();
+            let mut compute_made = HashMap::new();
             for _ in 0..200 {
                 let compute: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &compute_alloc, None).unwrap();
                 let c = runtime_vtable(&compute);
-                if made_from_now(c) {
-                    compute_made.insert(c);
+                let ext = vt(compute.as_raw()) as usize;
+                assert!(is_ext(ext), "the compute list was not adopted");
+                let compute_clear = *(c as *const usize).add(47);
+                if CLASSES.lock().unwrap().iter().any(|k| {
+                    k.ext == ext
+                        && k.orig == c
+                        && k.kind == Kind::CommandList
+                        && k.copied.as_deref().is_some_and(|m| m.get(47) == Some(&compute_clear))
+                }) {
+                    compute_made.insert(c, compute_clear);
                 }
                 compute.Close().unwrap();
                 drop(compute);
@@ -8970,7 +9040,7 @@ mod class_tests {
 
                 let direct: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &direct_alloc, None).unwrap();
                 let d = runtime_vtable(&direct);
-                if compute_made.contains(&d) {
+                if compute_made.get(&d).is_some_and(|&compute_clear| *(d as *const usize).add(47) != compute_clear) {
                     direct.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
                     assert!(direct.Close().is_ok(), "ClearDepthStencilView of a direct list at a compute list's vtable {d:#x} failed its Close");
                     return;
@@ -8980,6 +9050,6 @@ mod class_tests {
                 direct_alloc.Reset().unwrap();
             }
         }
-        crate::gpu::recomp::runner::skip_test("no direct list got a released compute list's vtable");
+        crate::gpu::recomp::runner::skip_test("no direct list got a released compute list's heap vtable with different methods");
     }
 }
